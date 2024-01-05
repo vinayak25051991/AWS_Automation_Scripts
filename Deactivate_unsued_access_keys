@@ -1,0 +1,176 @@
+import boto3
+from datetime import datetime, timedelta, timezone
+import sys
+
+DAYS_THRESHOLD = 90
+
+def format_last_used_time(last_used_date):
+    if last_used_date is None:
+        return "Access Key has not been used yet."
+
+    now = datetime.now(timezone.utc)
+    time_difference = now - last_used_date
+
+    days = time_difference.days
+    seconds = time_difference.seconds
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+
+    if days > 0:
+        return f"{days} days ago"
+    elif hours > 0:
+        return f"{hours} hours ago"
+    elif minutes > 0:
+        return f"{minutes} minutes ago"
+    else:
+        return "Less than a minute ago"
+
+def format_access_key_age(created_date):
+    now = datetime.now(timezone.utc)
+    age = now - created_date
+    return f"{age.days} days ago"
+
+def validate_user_exists(username):
+    try:
+        # Initialize IAM client
+        iam = boto3.client('iam')
+
+        # Check if the user exists
+        iam.get_user(UserName=username)
+
+        return True
+    except iam.exceptions.NoSuchEntityException:
+        return False
+    except Exception as e:
+        print(f"An error occurred while validating user: {e}")
+        return False
+
+def list_unused_access_keys(username=None):
+    try:
+        # Initialize IAM client
+        iam = boto3.client('iam')
+        unused_keys = []
+
+        # Validate user if specified
+        if username and not validate_user_exists(username):
+            print(f"Error: User {username} does not exist.")
+            return
+
+        # List all users or specified user
+        if username:
+            users = [{'UserName': username}]
+        else:
+            users = iam.list_users()['Users']
+
+        for user in users:
+            user_name = user['UserName']
+
+            # List access keys for each user
+            access_keys = iam.list_access_keys(UserName=user_name)['AccessKeyMetadata']
+
+            for key in access_keys:
+                access_key_id = key['AccessKeyId']
+                status = key['Status']
+                created_at = key['CreateDate'].replace(tzinfo=timezone.utc)
+                created_at_str = format_access_key_age(created_at)
+
+                # Calculate access key age
+                access_key_age = format_access_key_age(created_at)
+
+                # Get access key last used information
+                last_used = iam.get_access_key_last_used(AccessKeyId=access_key_id)
+                last_used_date = last_used['AccessKeyLastUsed'].get(
+                    'LastUsedDate') if 'AccessKeyLastUsed' in last_used else None
+
+                last_used_info = format_last_used_time(last_used_date)
+
+                # Check if the access key has not been used in the last 2 days
+                if last_used_date and (datetime.now(timezone.utc) - last_used_date) > timedelta(days=DAYS_THRESHOLD):
+                    unused_keys.append(f"User: {user_name} | Access Key ID: {access_key_id} | Status: {status} | Created Date: {created_at_str} | Last Used: {last_used_info}")
+                elif last_used_date is None:
+                    unused_keys.append(f"User: {user_name} | Access Key ID: {access_key_id} | Status: {status} | Created Date: {created_at_str} | Last Used: {last_used_info}")
+
+        # Print the unused access keys and keys that haven't been used yet
+        for key_info in unused_keys:
+            print(key_info)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+def remediate_access_key(username, access_key_id=None):
+    try:
+        # Initialize IAM client
+        iam = boto3.client('iam')
+
+        # Check if the user exists
+        if not validate_user_exists(username):
+            print(f"Error: User {username} does not exist.")
+            return
+
+        # List access keys for the user
+        access_keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+
+        for key in access_keys:
+            if access_key_id is None or key['AccessKeyId'] == access_key_id:
+                status = key['Status']
+
+                if status == 'Active':
+                    # Get access key last used information
+                    last_used = iam.get_access_key_last_used(AccessKeyId=key['AccessKeyId'])
+                    last_used_date = last_used['AccessKeyLastUsed'].get(
+                        'LastUsedDate') if 'AccessKeyLastUsed' in last_used else None
+
+                    # Check if the access key has been used in the last 2 days
+                    if last_used_date and (datetime.now(timezone.utc) - last_used_date) <= timedelta(days=DAYS_THRESHOLD):
+                        print(f"Checking condition for \"{key['AccessKeyId']}\"")
+                        print(f"Access key {key['AccessKeyId']} for user {username} is used within the last {DAYS_THRESHOLD} days hence we are skipping deactivation process for this key.")
+                        continue
+
+                    # Deactivate the access key
+                    iam.update_access_key(UserName=username, AccessKeyId=key['AccessKeyId'], Status='Inactive')
+                    print(f"Access key {key['AccessKeyId']} for user {username} is deactivated because it has not been used in the last {DAYS_THRESHOLD} days.")
+                else:
+                    print(f"Access key {key['AccessKeyId']} for user {username} is already inactive.")
+
+        if access_key_id is not None and all(key['AccessKeyId'] != access_key_id for key in access_keys):
+            print(f"Access key {access_key_id} for user {username} not found.")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+def remediate_multiple_users(usernames):
+    for username in usernames:
+        # Check if the user exists
+        if not validate_user_exists(username):
+            print(f"Error: User {username} does not exist.")
+            continue
+
+        print(f"[+] Deactivating access keys that have not been used in the last {DAYS_THRESHOLD} days for user {username}.")
+        remediate_access_key(username)
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == 'listall':
+        print(f"[+] Listing all access keys that have not been used in the last {DAYS_THRESHOLD} days.")
+        list_unused_access_keys()
+    elif len(sys.argv) == 3 and sys.argv[1] == 'list':
+        username = sys.argv[2]
+        print(f"[+] Listing access keys that have not been used in the last {DAYS_THRESHOLD} days for user {username}.")
+        list_unused_access_keys(username)
+    elif len(sys.argv) >= 3 and sys.argv[1] == 'remediate':
+        usernames = sys.argv[2].split(',')
+        remediate_multiple_users(usernames)
+    elif len(sys.argv) == 4 and sys.argv[1] == 'remediate':
+        username = sys.argv[2]
+        access_key_id = sys.argv[3]
+        print(f"[+] Deactivating access key {access_key_id} if it has not been used in the last {DAYS_THRESHOLD} days for user {username}.")
+        remediate_access_key(username, access_key_id)
+    else:
+        print("[!] Invalid command or arguments. Usage:")
+        print("    python scriptname.py listall")
+        print("    python scriptname.py list username")
+        print("    python scriptname.py remediate username1,username2")
+        print("    python scriptname.py remediate username access_key_id")
+
+if __name__ == '__main__':
+    main()
